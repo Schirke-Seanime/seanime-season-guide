@@ -8,9 +8,9 @@
 
 - **Top 10 tier list** — the season's best shows as an S / A / B / C pyramid, ranked by AniList score (weighted by the number of votes) and popularity. Early in a season it leans on popularity; before it starts, it shows the most anticipated shows.
 - **For you** — every show of the season sorted by how well it matches your taste, learned from your AniList list.
-- **Your list and dubs** — what's already in your list, and which shows AniLiberty dubs.
+- **Your list at a glance** — cards are tinted by their status in your list (completed, watching with a progress bar, planning, dropped).
 - **Filters** — formats, hide your list, AniLiberty dubs only. **+ Plan** adds a show to your Planning list.
-- Any year and season.
+- **Any year and season**, with the neighbouring seasons loaded in the background so switching is instant.
 
 ## Installation
 

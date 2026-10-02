@@ -57,10 +57,21 @@ function init() {
 
     async function load(year: number, season: string, force: boolean) {
       current = { year, season }
-      payload.set(Object.assign({}, payload.get() || {}, { loading: true, year, season }))
-      const result = await G.loadSeason(year, season, force)
-      // Ignore a slow answer for a season the user has already left.
-      if (current.year === year && current.season === season) payload.set(result)
+      // A season opened before shows up at once from the cache, even if it's
+      // due for a refresh; the fresh data replaces it when it arrives.
+      const cached = force ? null : G.cachedPayload(year, season)
+      if (cached) payload.set(Object.assign(cached, { loading: !cached.fresh }))
+      else payload.set(Object.assign({}, payload.get() || {}, { loading: true, year, season, items: null, tiers: [] }))
+
+      if (!cached || !cached.fresh) {
+        const result = await G.loadSeason(year, season, force)
+        // Ignore a slow answer for a season the user has already left.
+        if (current.year !== year || current.season !== season) return
+        payload.set(result)
+      }
+      // The neighbouring seasons load in the background, so switching to
+      // them is instant.
+      G.prefetchAround(year, season)
     }
 
     page.channel.on("load-season", (p: any) => {
@@ -105,6 +116,7 @@ function createSeasonGuide() {
   // Until this long after a season starts, few people have rated it yet.
   const EARLY_DAYS = 42
   const MAX_PAGES = 6
+  const MAX_CACHED_SEASONS = 12
 
   const ICON = `<span style="display:inline-flex;width:24px;height:24px;align-items:center;justify-content:center;color:currentColor"><svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="M20 12h2"/><path d="m19.07 4.93-1.41 1.41"/><path d="M15.95 15.95a6 6 0 1 0-7.9 0"/><path d="M4 20h16"/><path d="M7 16h10"/></svg></span>`
 
@@ -158,10 +170,15 @@ function createSeasonGuide() {
   // AniList
   // ---------------------------------------------------------------------------
 
+  // An AniList error (rate limit, outage) throws: treating it as empty data
+  // would overwrite good cached data with nothing.
   function query(token: string, q: string, variables: any): any {
     const res: any = $anilist.customQuery({ query: q, variables }, token)
+    if (!res || (res.errors && !res.data)) {
+      throw new Error("AniList didn't answer" + (res && res.errors ? ": " + JSON.stringify(res.errors).slice(0, 120) : ""))
+    }
     // customQuery may or may not unwrap "data".
-    return res && res.data ? res.data : res
+    return res.data ? res.data : res
   }
 
   function viewerId(token: string): number {
@@ -174,20 +191,107 @@ function createSeasonGuide() {
     return id
   }
 
-  function fetchSeason(token: string, year: number, season: string): SeasonItem[] {
-    const key = "sg-season-" + year + "-" + season
-    const cached = $storage.get(key)
-    if (cached && cached.at && Date.now() - cached.at < cacheTtl(year, season)) return cached.items
+  function seasonKey(year: number, season: string): string {
+    return "sg-season-" + year + "-" + season
+  }
 
-    const items: SeasonItem[] = []
-    for (let p = 1; p <= MAX_PAGES; p++) {
-      const d = query(token, SEASON_QUERY, { season, year, p })
-      const pageData = d && d.Page
-      for (const m of ((pageData && pageData.media) || [])) items.push(toItem(m))
-      if (!pageData || !pageData.pageInfo || !pageData.pageInfo.hasNextPage) break
-    }
+  function cachedSeason(year: number, season: string): { items: SeasonItem[], fresh: boolean } | null {
+    const cached = $storage.get(seasonKey(year, season))
+    if (!cached || !cached.at || !Array.isArray(cached.items)) return null
+    return { items: cached.items, fresh: Date.now() - cached.at < cacheTtl(year, season) }
+  }
+
+  // Keeps the last MAX_CACHED_SEASONS seasons; older ones are dropped.
+  function storeSeason(year: number, season: string, items: SeasonItem[]) {
+    const key = seasonKey(year, season)
     $storage.set(key, { at: Date.now(), items })
+    let index: string[] = $storage.get("sg-season-index") || []
+    index = index.filter((k) => k !== key)
+    index.push(key)
+    while (index.length > MAX_CACHED_SEASONS) $storage.remove(index.shift() as string)
+    $storage.set("sg-season-index", index)
+  }
+
+  // Public season data straight from AniList, so the pages can load in
+  // parallel: Seanime's client runs one request at a time and blocks the
+  // plugin meanwhile. No token is sent.
+  async function gql(q: string, variables: any): Promise<any> {
+    const res = await fetch("https://graphql.anilist.co", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "application/json" },
+      body: JSON.stringify({ query: q, variables }),
+    })
+    if (!res.ok) throw new Error("AniList HTTP " + res.status)
+    const j: any = await res.json()
+    if (j.errors) throw new Error("AniList: " + JSON.stringify(j.errors).slice(0, 200))
+    return j.data
+  }
+
+  async function downloadSeason(token: string, year: number, season: string): Promise<SeasonItem[]> {
+    const items: SeasonItem[] = []
+    const seen: { [id: number]: boolean } = {}
+    const take = (d: any) => {
+      for (const m of ((d && d.Page && d.Page.media) || [])) {
+        if (m && !seen[m.id]) { seen[m.id] = true; items.push(toItem(m)) }
+      }
+    }
+    try {
+      // Most seasons fit in 3 pages; ask for them at once, then go on if needed.
+      const first = await Promise.all([1, 2, 3].map((p) => gql(SEASON_QUERY, { season, year, p })))
+      first.forEach(take)
+      let last = first[2]
+      for (let p = 4; p <= MAX_PAGES && last && last.Page && last.Page.pageInfo && last.Page.pageInfo.hasNextPage; p++) {
+        last = await gql(SEASON_QUERY, { season, year, p })
+        take(last)
+      }
+      return items
+    } catch (e) {
+      // Rate limit or no network access: fall back to Seanime's client.
+      console.error("Season Guide: direct AniList request failed, using Seanime's client: " + e)
+      items.length = 0
+      for (const k in seen) delete seen[k as any]
+      for (let p = 1; p <= MAX_PAGES; p++) {
+        const d = query(token, SEASON_QUERY, { season, year, p })
+        // No page at all (rate limit, network): an error, not an empty season.
+        if (p === 1 && !(d && d.Page)) throw new Error("AniList didn't answer, try again in a minute")
+        take(d)
+        if (!d || !d.Page || !d.Page.pageInfo || !d.Page.pageInfo.hasNextPage) break
+      }
+      return items
+    }
+  }
+
+  async function fetchSeason(token: string, year: number, season: string, force?: boolean): Promise<SeasonItem[]> {
+    const cached = cachedSeason(year, season)
+    if (!force && cached && cached.fresh) return cached.items
+    const items = await downloadSeason(token, year, season)
+    storeSeason(year, season, items)
     return items
+  }
+
+  function neighbours(year: number, season: string): { year: number, season: string }[] {
+    const i = SEASONS.indexOf(season)
+    return [
+      i > 0 ? { year, season: SEASONS[i - 1] } : { year: year - 1, season: "FALL" },
+      i < 3 ? { year, season: SEASONS[i + 1] } : { year: year + 1, season: "WINTER" },
+    ]
+  }
+
+  // Loads the previous and next seasons into the cache, one after another.
+  let prefetching = false
+  async function prefetchAround(year: number, season: string) {
+    if (prefetching) return
+    prefetching = true
+    try {
+      const token = $database.anilist.getToken()
+      for (const n of neighbours(year, season)) {
+        const cached = cachedSeason(n.year, n.season)
+        if (cached && cached.fresh) continue
+        try { await fetchSeason(token, n.year, n.season) } catch (e) { console.error("Season Guide: prefetch: " + e) }
+      }
+    } finally {
+      prefetching = false
+    }
   }
 
   function toItem(m: any): SeasonItem {
@@ -230,12 +334,13 @@ function createSeasonGuide() {
   // scored shows count by how far their score is from your average, unscored
   // ones by their status (dropped counts against). Averages are pulled
   // towards zero for features you've seen only a couple of times.
-  function tasteProfile(token: string, userId: number): { [feature: string]: number } {
+  function tasteProfile(token: string, userId: number, force?: boolean): { [feature: string]: number } {
     const cached = $storage.get(TASTE_KEY)
-    if (cached && cached.at && cached.userId === userId && Date.now() - cached.at < 86400000) return cached.affinity
+    if (!force && cached && cached.at && cached.userId === userId && Date.now() - cached.at < 86400000) return cached.affinity
 
     const d = query(token, TASTE_QUERY, { u: userId })
-    const lists: any[] = (d && d.MediaListCollection && d.MediaListCollection.lists) || []
+    if (!d || !d.MediaListCollection) throw new Error("AniList returned no list")
+    const lists: any[] = d.MediaListCollection.lists || []
     const entries: any[] = []
     for (const l of lists) for (const e of (l.entries || [])) if (e && e.media) entries.push(e)
 
@@ -425,29 +530,52 @@ function createSeasonGuide() {
       if (SEASONS.indexOf(season) < 0) season = currentSeason(Date.now()).season
       const token = $database.anilist.getToken()
       if (!token) return { error: "Not logged in to AniList: log in in Seanime.", year, season, prefs }
-      if (force) {
-        $storage.remove("sg-season-" + year + "-" + season)
-        $storage.remove("sg-dub-" + year + "-" + season)
-        $storage.remove(TASTE_KEY)
-      }
-      const userId = viewerId(token)
-      const items = fetchSeason(token, year, season)
-      const affinity = tasteProfile(token, userId)
-      const match: { [id: string]: number } = {}
-      for (const i of items) match[String(i.id)] = matchOf(i, affinity)
-      const ranking = rankSeason(items, year, season, Date.now())
-      const dub = await dubbedMalIds(year, season)
-      return {
-        year, season, items, match,
-        tiers: ranking.tiers, mode: ranking.mode,
-        library: libraryMap(),
-        dub,
-        prefs,
-        updatedAt: Date.now(),
-      }
+      // A refresh bypasses the caches instead of clearing them first, so a
+      // failed refresh still has the last good data to show.
+      if (force) $storage.remove("sg-dub-" + year + "-" + season)
+      // Both run over the network while the taste profile is worked out.
+      const itemsP = fetchSeason(token, year, season, force)
+      const dubP = dubbedMalIds(year, season)
+      // Await the requests even if the taste profile fails, so none of their
+      // errors goes unhandled.
+      let affinity: any = null
+      let tasteError: any = null
+      try { affinity = tasteProfile(token, viewerId(token), force) } catch (e) { tasteError = e }
+      const items = await itemsP
+      const dub = await dubP
+      if (tasteError) throw tasteError
+      return buildPayload(year, season, items, affinity, dub, prefs, true)
     } catch (e) {
       console.error("Season Guide: " + e)
+      const stale = cachedPayload(year, season)
+      if (stale) return Object.assign(stale, { loading: false, warning: "Couldn't refresh: " + e })
       return { error: "Couldn't load the season: " + e, year, season, prefs }
+    }
+  }
+
+  // What the page shows, from cached data only (any age); null if the season
+  // was never loaded. `fresh` says whether it still needs a refresh.
+  function cachedPayload(year: number, season: string): any {
+    const cached = cachedSeason(year, season)
+    if (!cached) return null
+    const taste = $storage.get(TASTE_KEY)
+    const dub = $storage.get("sg-dub-" + year + "-" + season)
+    const p = buildPayload(year, season, cached.items, (taste && taste.affinity) || {}, dub ? dub.ids : null, readPrefs(), !!taste)
+    p.fresh = cached.fresh && !!taste
+    return p
+  }
+
+  function buildPayload(year: number, season: string, items: SeasonItem[], affinity: any, dub: number[] | null, prefs: any, hasTaste: boolean): any {
+    const match: { [id: string]: number } = {}
+    if (hasTaste) for (const i of items) match[String(i.id)] = matchOf(i, affinity)
+    const ranking = rankSeason(items, year, season, Date.now())
+    return {
+      year, season, items, match,
+      tiers: ranking.tiers, mode: ranking.mode,
+      library: libraryMap(),
+      dub,
+      prefs,
+      updatedAt: Date.now(),
     }
   }
 
@@ -464,7 +592,7 @@ function createSeasonGuide() {
   :root {
     --bg: #0b0b0d; --paper: #131317; --paper2: #1a1a20; --line: #26262e;
     --text: #ececf1; --muted: #8a8a96; --brand: #7c6cf2; --on-brand: #fff;
-    --yellow: #e6b422; --green: #3fbf6a;
+    --yellow: #e6b422; --green: #3fbf6a; --blue: #5b8def;
     --s: #ff7f7f; --a: #ffbf7f; --b: #ffdf7f; --c: #bfff7f;
   }
   * { box-sizing: border-box; }
@@ -528,6 +656,19 @@ function createSeasonGuide() {
   .pill.dub { background: rgba(63,191,106,.15); color: var(--green); }
   .pill.list { background: rgba(230,180,34,.14); color: var(--yellow); }
   .score { font-size: 12px; font-weight: 650; }
+  /* Tint by status in your list, as in Anime Diary */
+  .card, .tcard { position: relative; overflow: hidden; }
+  .st-done { background: color-mix(in srgb, var(--green) 14%, var(--paper2)); border-color: color-mix(in srgb, var(--green) 45%, var(--line)); }
+  .st-watching { background: color-mix(in srgb, var(--yellow) 12%, var(--paper2)); border-color: color-mix(in srgb, var(--yellow) 40%, var(--line)); }
+  .st-planned { background: color-mix(in srgb, var(--blue) 12%, var(--paper2)); border-color: color-mix(in srgb, var(--blue) 40%, var(--line)); }
+  .st-dropped { background: color-mix(in srgb, #000 25%, var(--paper2)); opacity: .7; }
+  .st-done .pill.list { background: rgba(63,191,106,.18); color: var(--green); }
+  .st-planned .pill.list { background: rgba(91,141,239,.18); color: var(--blue); }
+  .st-dropped .pill.list { background: rgba(120,120,130,.2); color: #a0a0aa; }
+  .progress { position: absolute; left: 0; right: 0; bottom: 0; height: 3px; background: rgba(255,255,255,.06); }
+  .progress div { height: 100%; background: var(--yellow); }
+  .legend { font-size: 12px; color: var(--muted); display: inline-flex; align-items: center; gap: 4px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-left: 8px; }
   .plan { padding: 2px 9px; font-size: 12px; border-radius: 8px; margin-left: auto; }
   .empty { color: var(--muted); padding: 24px; text-align: center; }
   .error { color: #ff8a8a; }
@@ -594,6 +735,18 @@ function listBadge(i) {
   var progress = (l.status === "CURRENT" || l.status === "PAUSED") && l.progress ? " " + l.progress + "/" + (i.episodes || "?") : "";
   return '<span class="pill list">' + esc(name + progress) + '</span>';
 }
+// The card is tinted by the show's status in your list.
+var STATUS_CLASS = { COMPLETED: "done", CURRENT: "watching", REPEATING: "watching", PAUSED: "watching", PLANNING: "planned", DROPPED: "dropped" };
+function statusClass(i) { var l = listOf(i); return l && STATUS_CLASS[l.status] ? " st-" + STATUS_CLASS[l.status] : ""; }
+function progressBar(i) {
+  var l = listOf(i);
+  if (!l || (l.status !== "CURRENT" && l.status !== "PAUSED" && l.status !== "REPEATING") || !l.progress) return "";
+  var total = i.episodes || (i.nextEpisode ? i.nextEpisode - 1 : 0);
+  if (!total) return "";
+  return '<div class="progress"><div style="width:' + Math.min(100, Math.round(l.progress / total * 100)) + '%"></div></div>';
+}
+// No match until the taste profile is ready (a season shown from the cache on the first visit).
+function matchPill(i) { var m = matchOf(i); return m ? '<span class="pill match">' + m + '% match</span>' : ''; }
 function scoreText(i) { return i.score ? "★ " + (i.score / 10).toFixed(1) : "★ —"; }
 
 // ---------- header ----------
@@ -604,7 +757,8 @@ function renderHead(top) {
   }).join("");
   var count = DATA.items ? DATA.items.length + " anime" : "";
   return '<div class="row head"><div><h1>Season Guide</h1><div class="sub">' + SEASON_NAME[s] + ' ' + y + (count ? ' · ' + count : '') +
-    (DATA.loading ? ' · loading…' : '') + '</div></div><span class="spacer"></span>' +
+    (DATA.loading ? ' · loading…' : '') +
+    (DATA.warning ? ' · <span class="error">' + esc(DATA.warning) + '</span>' : '') + '</div></div><span class="spacer"></span>' +
     '<button data-act="year" data-v="-1">‹</button><b style="min-width:44px;text-align:center">' + y + '</b><button data-act="year" data-v="1">›</button>' +
     '<span class="seg">' + seasonTabs + '</span>' +
     '<button data-act="refresh" title="Fetch the season again from AniList">Refresh</button></div>';
@@ -622,12 +776,12 @@ function renderTiers(map) {
     var cards = t.ids.map(function (id) {
       var i = map[id]; rank++;
       if (!i) return "";
-      return '<div class="tcard" data-open="' + i.id + '"><span class="rank">#' + rank + '</span>' +
+      return '<div class="tcard' + statusClass(i) + '" data-open="' + i.id + '"><span class="rank">#' + rank + '</span>' +
         '<img src="' + esc(i.coverLarge || i.cover) + '" loading="lazy">' +
         '<div class="body"><div class="t">' + esc(i.title) + '</div>' +
         '<div class="meta">' + esc(FORMAT_NAME[i.format] || i.format) + (i.studios[0] ? ' · ' + esc(i.studios[0]) : '') + '</div>' +
-        '<div class="pills"><span class="score">' + scoreText(i) + '</span><span class="pill match">' + matchOf(i) + '% match</span>' +
-        (isDubbed(i) ? '<span class="pill dub">AniLiberty dub</span>' : '') + listBadge(i) + '</div></div></div>';
+        '<div class="pills"><span class="score">' + scoreText(i) + '</span>' + matchPill(i) + listBadge(i) + '</div></div>' +
+        progressBar(i) + '</div>';
     }).join("");
     return '<div class="tier ' + t.tier + '"><div class="tier-label" style="background:var(--' + t.tier.toLowerCase() + ')">' + t.tier + '</div>' +
       '<div class="tier-items">' + cards + '</div></div>';
@@ -673,18 +827,21 @@ function renderAll() {
 
   var cards = items.map(function (i) {
     var plan = listOf(i) ? '' : '<button class="plan" data-act="plan" data-id="' + i.id + '" title="Add to Planning on AniList">+ Plan</button>';
-    return '<div class="card" data-open="' + i.id + '"><img src="' + esc(i.coverLarge || i.cover) + '" loading="lazy">' +
+    return '<div class="card' + statusClass(i) + '" data-open="' + i.id + '"><img src="' + esc(i.coverLarge || i.cover) + '" loading="lazy">' +
       '<div class="body"><div class="t">' + esc(i.title) + '</div>' +
       '<div class="meta">' + esc(FORMAT_NAME[i.format] || i.format) + (i.episodes ? ' · ' + i.episodes + ' eps' : '') + ' · ' + esc(dateOf(i)) + '</div>' +
       (i.studios[0] ? '<div class="meta">' + esc(i.studios.join(", ")) + '</div>' : '') +
       '<div class="genres">' + i.genres.slice(0, 3).map(function (g) { return '<span class="genre">' + esc(g) + '</span>'; }).join("") + '</div>' +
-      '<div class="pills"><span class="score">' + scoreText(i) + '</span><span class="pill match">' + matchOf(i) + '% match</span>' +
-      (isDubbed(i) ? '<span class="pill dub">AniLiberty dub</span>' : '') + listBadge(i) + plan + '</div></div></div>';
+      '<div class="pills"><span class="score">' + scoreText(i) + '</span>' + matchPill(i) + listBadge(i) + plan + '</div></div>' +
+      progressBar(i) + '</div>';
   }).join("");
 
   return '<section><div class="row" style="margin-bottom:12px"><h2>All anime <span class="muted">· ' + items.length + '</span></h2>' +
     '<span class="spacer"></span>' + sortSeg + '</div>' +
-    '<div class="row" style="margin-bottom:12px">' + formatChips + '<span style="width:12px"></span>' + toggles + '</div>' +
+    '<div class="row" style="margin-bottom:12px">' + formatChips + '<span style="width:12px"></span>' + toggles +
+    '<span class="spacer"></span><span class="legend"><i style="background:var(--green)"></i>completed' +
+    '<i style="background:var(--yellow)"></i>watching<i style="background:var(--blue)"></i>planning' +
+    '<i style="background:var(--gray, #6b6b76)"></i>dropped</span></div>' +
     (items.length ? '<div class="cards">' + cards + '</div>' : '<div class="empty">Nothing matches the filters.</div>') + '</section>';
 }
 
@@ -742,5 +899,5 @@ render();
 </body>
 </html>`
 
-  return { ICON, PAGE_HTML, currentSeason, loadSeason, addToPlanning, savePrefs, rankSeason, matchOf }
+  return { ICON, PAGE_HTML, currentSeason, loadSeason, cachedPayload, prefetchAround, addToPlanning, savePrefs, rankSeason, matchOf }
 }
