@@ -389,6 +389,23 @@ function createSeasonGuide() {
     return Math.round(100 / (1 + Math.exp(-raw * 7)))
   }
 
+  // Why a show got its match: the features that pushed it up the most and
+  // down the most, with the same weights as matchOf(). Features you feel
+  // about weakly either way are left out.
+  function explainMatch(item: SeasonItem, affinity: { [f: string]: number }): { p: string[], n: string[] } {
+    const parts: { name: string, v: number }[] = []
+    const add = (f: string, name: string, fw: number) => {
+      const a = affinity[f] || 0
+      if (Math.abs(a) >= 0.08) parts.push({ name, v: a * fw })
+    }
+    for (const g of item.genres) add("g:" + g, g, 1)
+    for (const s of item.studios) add("s:" + s, s, 0.8)
+    for (const t of item.tags) add("t:" + t, t, 0.5)
+    const p = parts.filter((x) => x.v > 0).sort((a, b) => b.v - a.v).slice(0, 4).map((x) => x.name)
+    const n = parts.filter((x) => x.v < 0).sort((a, b) => a.v - b.v).slice(0, 3).map((x) => x.name)
+    return { p, n }
+  }
+
   // ---------------------------------------------------------------------------
   // Tier list
   // ---------------------------------------------------------------------------
@@ -567,10 +584,16 @@ function createSeasonGuide() {
 
   function buildPayload(year: number, season: string, items: SeasonItem[], affinity: any, dub: number[] | null, prefs: any, hasTaste: boolean): any {
     const match: { [id: string]: number } = {}
-    if (hasTaste) for (const i of items) match[String(i.id)] = matchOf(i, affinity)
+    const why: { [id: string]: { p: string[], n: string[] } } = {}
+    if (hasTaste) {
+      for (const i of items) {
+        match[String(i.id)] = matchOf(i, affinity)
+        why[String(i.id)] = explainMatch(i, affinity)
+      }
+    }
     const ranking = rankSeason(items, year, season, Date.now())
     return {
-      year, season, items, match,
+      year, season, items, match, why,
       tiers: ranking.tiers, mode: ranking.mode,
       library: libraryMap(),
       dub,
@@ -652,7 +675,17 @@ function createSeasonGuide() {
   .genre { font-size: 11px; background: #23232b; border-radius: 99px; padding: 1px 7px; color: #b9b9c3; }
   .pills { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; margin-top: auto; }
   .pill { font-size: 11px; padding: 1px 7px; border-radius: 99px; }
-  .pill.match { background: color-mix(in srgb, var(--brand) 22%, transparent); color: var(--text); }
+  .pill.match { background: color-mix(in srgb, var(--brand) 22%, transparent); color: var(--text); cursor: help; }
+  #tip { position: absolute; display: none; z-index: 50; max-width: 320px; pointer-events: none;
+    background: #1f1f27; border: 1px solid #34343f; border-radius: 10px; padding: 10px 12px; font-size: 12px;
+    box-shadow: 0 8px 24px rgba(0,0,0,.5); }
+  #tip b { font-size: 13px; display: block; margin-bottom: 6px; }
+  #tip div { margin-top: 3px; }
+  .tip-row { display: flex; gap: 8px; }
+  .tip-label { flex: none; width: 96px; color: var(--muted); }
+  .tip-label.good { color: var(--green); }
+  .tip-label.bad { color: #ff8a8a; }
+  .tip-foot { color: var(--muted); font-size: 11px; margin-top: 8px !important; }
   .pill.dub { background: rgba(63,191,106,.15); color: var(--green); }
   .pill.list { background: rgba(230,180,34,.14); color: var(--yellow); }
   .score { font-size: 12px; font-weight: 650; }
@@ -678,6 +711,7 @@ function createSeasonGuide() {
 <body>
 <div class="hero" id="hero"></div>
 <div class="wrap" id="root"><div class="empty">Loading the season…</div></div>
+<div id="tip"></div>
 <script>
 var DATA = null;
 var PREFS = { sort: "match", formats: ["tv", "ona", "movie", "ova"], hideInList: false, dubOnly: false };
@@ -746,7 +780,36 @@ function progressBar(i) {
   return '<div class="progress"><div style="width:' + Math.min(100, Math.round(l.progress / total * 100)) + '%"></div></div>';
 }
 // No match until the taste profile is ready (a season shown from the cache on the first visit).
-function matchPill(i) { var m = matchOf(i); return m ? '<span class="pill match">' + m + '% match</span>' : ''; }
+function matchPill(i) { var m = matchOf(i); return m ? '<span class="pill match" data-why="' + i.id + '">' + m + '% match</span>' : ''; }
+
+// ---------- match tooltip ----------
+// One floating box for the whole page, so the cards' clipping doesn't cut it.
+function tooltipHtml(id) {
+  var m = (DATA.match || {})[String(id)];
+  var w = (DATA.why || {})[String(id)] || { p: [], n: [] };
+  var lines = '<b>' + m + '% match</b>';
+  if (w.p.length) lines += '<div class="tip-row"><span class="tip-label good">You like</span><span>' + esc(w.p.join(", ")) + '</span></div>';
+  if (w.n.length) lines += '<div class="tip-row"><span class="tip-label bad">Not your thing</span><span>' + esc(w.n.join(", ")) + '</span></div>';
+  if (!w.p.length && !w.n.length) lines += '<div class="muted">Not enough in common with your list to tell — neutral.</div>';
+  return lines + '<div class="tip-foot">From genres, studios and tags of what you scored and watched on AniList.</div>';
+}
+function showTip(el) {
+  var tip = document.getElementById("tip");
+  tip.innerHTML = tooltipHtml(el.getAttribute("data-why"));
+  tip.style.display = "block";
+  var r = el.getBoundingClientRect();
+  var left = Math.min(r.left + window.scrollX, document.documentElement.clientWidth - tip.offsetWidth - 8);
+  var top = r.top + window.scrollY - tip.offsetHeight - 8;
+  if (top < window.scrollY + 4) top = r.bottom + window.scrollY + 8;
+  tip.style.left = Math.max(8, left) + "px";
+  tip.style.top = top + "px";
+}
+function hideTip() { var tip = document.getElementById("tip"); if (tip) tip.style.display = "none"; }
+document.addEventListener("mouseover", function (ev) {
+  var el = ev.target.closest ? ev.target.closest("[data-why]") : null;
+  if (el) showTip(el); else hideTip();
+});
+document.addEventListener("scroll", hideTip, true);
 function scoreText(i) { return i.score ? "★ " + (i.score / 10).toFixed(1) : "★ —"; }
 
 // ---------- header ----------
