@@ -45,7 +45,10 @@ function init() {
     const page = ctx.newWebview({
       slot: "screen",
       fullWidth: true,
-      autoHeight: true,
+      // A screen-tall frame that scrolls itself, rather than one sized to fit
+      // its content: in a frame with nothing to scroll, Chrome's middle-click
+      // autoscroll gets stuck and the wheel stops working until the next click.
+      height: "100vh",
       sidebar: { label: "Season Guide", icon: G.ICON },
     })
 
@@ -619,7 +622,7 @@ function createSeasonGuide() {
     --s: #ff7f7f; --a: #ffbf7f; --b: #ffdf7f; --c: #bfff7f;
   }
   * { box-sizing: border-box; }
-  html { background: var(--bg); color-scheme: dark; }
+  html { background: var(--bg); color-scheme: dark; scrollbar-width: thin; scrollbar-color: #3a3a46 transparent; }
   html, body { margin: 0; color: var(--text); font: 14px/1.4 Inter, "Segoe UI", system-ui, sans-serif; }
   body { position: relative; overflow-x: hidden; }
   .hero { position: absolute; top: 0; left: 0; right: 0; height: 440px; pointer-events: none;
