@@ -1,16 +1,16 @@
 {
   "id": "season-guide",
   "name": "Season Guide",
-  "version": "1.2.1",
-  "manifestURI": "https://raw.githubusercontent.com/Schirke/seanime-season-guide/main/src/manifest.json",
+  "version": "1.2.2",
+  "manifestURI": "https://raw.githubusercontent.com/Schirke-Seanime/seanime-season-guide/main/src/manifest.json",
   "language": "typescript",
   "type": "plugin",
   "description": "Every anime of a season, sorted by how well it matches your taste, with a top-10 tier list and your list status at a glance.",
   "author": "Schirke",
-  "icon": "https://raw.githubusercontent.com/Schirke/seanime-season-guide/main/src/icon.png",
-  "website": "https://github.com/Schirke/seanime-season-guide",
+  "icon": "https://raw.githubusercontent.com/Schirke-Seanime/seanime-season-guide/main/src/icon.png",
+  "website": "https://github.com/Schirke-Seanime/seanime-season-guide",
   "lang": "en",
-  "payloadURI": "https://raw.githubusercontent.com/Schirke/seanime-season-guide/main/src/SeasonGuide.ts",
+  "payloadURI": "https://raw.githubusercontent.com/Schirke-Seanime/seanime-season-guide/main/src/SeasonGuide.ts",
   "plugin": {
     "version": "1",
     "permissions": {

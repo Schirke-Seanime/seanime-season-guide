@@ -17,7 +17,7 @@
 In Seanime, open **Extensions** → **Add extension**, paste the manifest URL and allow the requested permissions:
 
 ```
-https://raw.githubusercontent.com/Schirke/seanime-season-guide/main/src/manifest.json
+https://raw.githubusercontent.com/Schirke-Seanime/seanime-season-guide/main/src/manifest.json
 ```
 
 The **Season Guide** page appears in the sidebar.
